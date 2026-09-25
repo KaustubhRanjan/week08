@@ -3,6 +3,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.exc import OperationalError
 
 from app.db import Base, engine
@@ -64,6 +65,15 @@ app = FastAPI(
 )
 
 
+# Expose Prometheus metrics at /metrics so Prometheus can scrape
+# request counts, latencies and error rates for this service.
+Instrumentator(
+    excluded_handlers=["/metrics", "/health"],
+).instrument(app).expose(
+    app,
+    include_in_schema=False,
+)
+
 app.include_router(enrollments.router)
 
 
@@ -81,4 +91,4 @@ def health_check() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "enrollment-service",
-    }
+    }

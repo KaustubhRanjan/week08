@@ -5,15 +5,117 @@ on:
   push:
     branches:
       - main
-  
+
   # Manual trigger for the workflow
   workflow_dispatch:
 
+permissions:
+  contents: read
 
 jobs:
 
   # =========================================================
-  # Backend Tests
+  # Stage 1: Infrastructure as Code (Terraform)
+  # Provisions / reconciles the resource group, ACR, AKS and
+  # storage account BEFORE any image is built or deployed.
+  # =========================================================
+  terraform:
+    name: Terraform (fmt, validate, plan, apply)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export Azure service principal for Terraform
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          CLIENT_SECRET=$(jq -r '.clientSecret' <<< "$AZURE_CREDENTIALS")
+          echo "::add-mask::$CLIENT_SECRET"
+          {
+            echo "ARM_CLIENT_ID=$(jq -r '.clientId' <<< "$AZURE_CREDENTIALS")"
+            echo "ARM_CLIENT_SECRET=$CLIENT_SECRET"
+            echo "ARM_SUBSCRIPTION_ID=$(jq -r '.subscriptionId' <<< "$AZURE_CREDENTIALS")"
+            echo "ARM_TENANT_ID=$(jq -r '.tenantId' <<< "$AZURE_CREDENTIALS")"
+          } >> "$GITHUB_ENV"
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Create the Terraform state storage account on first run
+      # (idempotent - does nothing if it already exists).
+      - name: Bootstrap Terraform state storage
+        run: |
+          RG="${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          SA="${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          if ! az storage account show --name "$SA" --resource-group "$RG" >/dev/null 2>&1; then
+            az storage account create \
+              --name "$SA" \
+              --resource-group "$RG" \
+              --location "$(az group show --name "$RG" --query location -o tsv)" \
+              --sku Standard_LRS \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false
+          fi
+          KEY=$(az storage account keys list --account-name "$SA" --resource-group "$RG" --query "[0].value" -o tsv)
+          echo "::add-mask::$KEY"
+          az storage container create --name tfstate --account-name "$SA" --account-key "$KEY" --output none
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (remote state in Azure Storage)
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=week08.terraform.tfstate"
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+          {
+            echo "## Terraform plan"
+            echo '```'
+            grep -E "^(Plan:|No changes)" plan.txt || tail -n 5 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Terraform outputs
+        if: github.ref == 'refs/heads/main'
+        run: |
+          {
+            echo "## Terraform outputs"
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  # =========================================================
+  # Stage 2: Backend Tests
   # =========================================================
   backend-test:
     name: Test ${{ matrix.service }}
@@ -103,14 +205,18 @@ jobs:
 
 
   # =========================================================
-  # Build and Push Docker Images
+  # Stage 3: Build, Security Scan (Docker Scout) and Push
+  # Images are scanned BEFORE they are pushed to ACR, so an
+  # image with fixable critical/high CVEs never reaches the
+  # registry or the cluster.
   # =========================================================
-  build-and-push:
-    name: Build and Push ${{ matrix.image }}
+  build-scan-push:
+    name: Build, scan and push ${{ matrix.image }}
     runs-on: ubuntu-latest
 
-    # All backend tests must pass before this job starts
+    # Infrastructure must exist and all backend tests must pass
     needs:
+      - terraform
       - backend-test
 
     # Build and push when code is pushed to main or manually triggered
@@ -139,6 +245,9 @@ jobs:
           - service: enrollment-service
             image: koalatech-enrollment-service
 
+    env:
+      IMAGE_REF: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+
     steps:
 
       - name: Checkout repository
@@ -153,14 +262,70 @@ jobs:
         run: |
           az acr login --name ${{ vars.ACR_NAME }}
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            --platform linux/amd64 \
-            -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
-            ./${{ matrix.service }}
+      # Docker Scout requires a Docker Hub account
+      - name: Login to Docker Hub (for Docker Scout)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push Docker image with commit SHA
-        run: |
-          docker push \
-            ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (load locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_REF }}
+
+      - name: Docker Scout - vulnerability report (all severities)
+        uses: docker/scout-action@v1
+        with:
+          command: quickview,cves
+          image: local://${{ env.IMAGE_REF }}
+          sarif-file: scout-${{ matrix.service }}.sarif
+          summary: true
+          exit-code: false
+
+      - name: Docker Scout - base image recommendations
+        uses: docker/scout-action@v1
+        with:
+          command: recommendations
+          image: local://${{ env.IMAGE_REF }}
+          summary: true
+
+      - name: Upload Docker Scout report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-scout-${{ matrix.service }}
+          path: scout-${{ matrix.service }}.sarif
+          if-no-files-found: ignore
+
+      # Security gate: fail the build if the image contains
+      # critical/high vulnerabilities that already have a fix.
+      - name: Docker Scout - security gate
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://${{ env.IMAGE_REF }}
+          only-severities: ${{ vars.SCOUT_FAIL_SEVERITIES || 'critical,high' }}
+          only-fixed: true
+          summary: false
+          exit-code: true
+
+      # Only reached when the gate passes. Rebuilds from the build
+      # cache and pushes with an SBOM and provenance attestation
+      # (supply-chain policy finding from Task 10.1P).
+      - name: Push image with SBOM and provenance
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          platforms: linux/amd64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.IMAGE_REF }}

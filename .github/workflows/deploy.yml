@@ -1,9 +1,9 @@
 name: Build and Deploy to AKS
 
+# Legacy single-service workflow (Task 9.3C). Superseded by the
+# 01-04 pipeline, so it now only runs when triggered manually.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
@@ -41,4 +41,4 @@ jobs:
       - name: Deploy to AKS
         run: |
           kubectl set image deployment/frontend frontend=${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }} -n default || kubectl create deployment frontend --image=${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }} -n default
-          kubectl rollout status deployment/frontend -n default || true
+          kubectl rollout status deployment/frontend -n default || true

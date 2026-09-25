@@ -1,0 +1,29 @@
+# Tells Prometheus to scrape the /metrics endpoint exposed by each
+# KoalaTech FastAPI service (prometheus-fastapi-instrumentator)
+# in both the staging and production namespaces.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: koalatech-services
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: koalatech
+spec:
+  namespaceSelector:
+    matchNames:
+      - staging
+      - production
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - user-service
+          - student-service
+          - lecturer-service
+          - course-service
+          - enrollment-service
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

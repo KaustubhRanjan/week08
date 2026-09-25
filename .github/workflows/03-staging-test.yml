@@ -14,7 +14,7 @@ jobs:
     name: Staging Smoke Test
     runs-on: ubuntu-latest
 
-    if: >
+    if: >-
       ${{ github.event.workflow_run.conclusion == 'success' }}
 
     environment:
@@ -61,3 +61,70 @@ jobs:
             --retry 10 \
             --retry-delay 5 \
             http://${{ env.FRONTEND_IP }}
+
+      - name: Test backend services through the frontend proxy
+        run: |
+          for service in users students lecturers courses enrollments; do
+            echo "Checking /api/$service/health"
+            curl --fail --silent --show-error \
+              --retry 10 --retry-delay 5 --retry-all-errors \
+              "http://${{ env.FRONTEND_IP }}/api/$service/health"
+            echo
+          done
+
+      - name: Generate traffic for monitoring
+        run: |
+          for i in $(seq 1 30); do
+            for service in users students lecturers courses enrollments; do
+              curl --silent --output /dev/null "http://${{ env.FRONTEND_IP }}/api/$service/"
+            done
+          done
+
+      # =====================================================
+      # Monitoring validation
+      # =====================================================
+      - name: Verify Prometheus is scraping the application
+        run: |
+          kubectl port-forward -n monitoring svc/prometheus-operated 9090:9090 >/dev/null 2>&1 &
+          sleep 5
+
+          # Wait up to 5 minutes for all 5 staging services to be scraped and up
+          for i in $(seq 1 30); do
+            RESULT=$(curl -s --get http://localhost:9090/api/v1/query \
+              --data-urlencode 'query=up{namespace="staging",container=~".+-service"}')
+            UP=$(jq '[.data.result[] | select(.value[1]=="1")] | length' <<< "$RESULT")
+            echo "Staging services up in Prometheus: $UP/5"
+            if [ "$UP" -ge 5 ]; then break; fi
+            sleep 10
+          done
+
+          {
+            echo "## Prometheus scrape targets (staging)"
+            echo "| Service | Pod | Up |"
+            echo "|---|---|---|"
+            jq -r '.data.result[] | "| \(.metric.container) | \(.metric.pod) | \(.value[1]) |"' <<< "$RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          REQUESTS=$(curl -s --get http://localhost:9090/api/v1/query \
+            --data-urlencode 'query=sum(http_requests_total{namespace="staging"})' \
+            | jq -r '.data.result[0].value[1] // "0"')
+          echo "Total HTTP requests recorded in staging: $REQUESTS"
+          echo "Total HTTP requests recorded by Prometheus (staging): **$REQUESTS**" >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$UP" -ge 5 ] || { echo "Prometheus is not scraping all services"; exit 1; }
+
+      - name: Verify Grafana and the KoalaTech dashboard
+        run: |
+          kubectl port-forward -n monitoring svc/kps-grafana 3000:80 >/dev/null 2>&1 &
+          sleep 5
+
+          curl --fail --silent --show-error http://localhost:3000/api/health
+          echo
+
+          DASHBOARDS=$(curl --fail --silent --show-error \
+            -u "admin:${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
+            "http://localhost:3000/api/search?query=KoalaTech")
+          echo "$DASHBOARDS" | jq -r '.[].title'
+          [ "$(jq length <<< "$DASHBOARDS")" -ge 1 ] || { echo "Dashboard not found"; exit 1; }
+
+          echo "Grafana is healthy and the **KoalaTech Services Overview** dashboard is provisioned." >> "$GITHUB_STEP_SUMMARY"

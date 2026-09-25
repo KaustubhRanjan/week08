@@ -14,7 +14,7 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
 
-    if: >
+    if: >-
       ${{ github.event.workflow_run.conclusion == 'success' }}
 
     environment:
@@ -38,11 +38,69 @@ jobs:
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
 
+      # The storage account is (re)created by Terraform, so read its
+      # connection string at deploy time instead of storing it as a secret.
+      - name: Get storage connection string from Azure
+        run: |
+          STORAGE_ACCOUNT=$(az storage account list \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --query "[?tags.ManagedBy=='Terraform'] | [0].name" -o tsv)
+          CONNECTION_STRING=$(az storage account show-connection-string \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name "$STORAGE_ACCOUNT" \
+            --query connectionString -o tsv)
+          echo "::add-mask::$CONNECTION_STRING"
+          echo "AZURE_STORAGE_CONNECTION_STRING=$CONNECTION_STRING" >> "$GITHUB_ENV"
+
+      # =====================================================
+      # Monitoring: Prometheus + Grafana (kube-prometheus-stack)
+      # Installed before the application so new pods are
+      # scraped from the moment they start.
+      # =====================================================
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy Prometheus and Grafana
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --values monitoring/kube-prometheus-stack-values.yaml \
+            --set-string grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
+            --wait \
+            --timeout 10m
+
+      - name: Configure application scraping and Grafana dashboard
+        run: |
+          kubectl apply -f monitoring/podmonitor.yaml
+          kubectl apply -f monitoring/grafana-dashboard.yaml
+          kubectl get pods -n monitoring
+
       - name: Create staging namespace
         run: |
           kubectl create namespace staging \
             --dry-run=client \
             -o yaml | kubectl apply -f -
+
+      # Lets AKS pull images from ACR using the registry credentials
+      # (used because the lab cannot create an AcrPull role assignment).
+      - name: Create ACR image pull secret
+        run: |
+          ACR_USERNAME=$(az acr credential show --name ${{ vars.ACR_NAME }} --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name ${{ vars.ACR_NAME }} --query "passwords[0].value" -o tsv)
+          echo "::add-mask::$ACR_PASSWORD"
+          kubectl create secret docker-registry acr-pull-secret \
+            --namespace staging \
+            --docker-server=${{ vars.ACR_LOGIN_SERVER }} \
+            --docker-username="$ACR_USERNAME" \
+            --docker-password="$ACR_PASSWORD" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default \
+            --namespace staging \
+            -p '{"imagePullSecrets":[{"name":"acr-pull-secret"}]}'
 
       - name: Create PostgreSQL secret
         run: |
@@ -63,7 +121,7 @@ jobs:
             --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
             --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
             --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
-            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
@@ -148,4 +206,4 @@ jobs:
         run: |
           kubectl get pods -n staging
           kubectl get services -n staging
-          kubectl get pvc -n staging
+          kubectl get pvc -n staging

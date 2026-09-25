@@ -18,7 +18,8 @@ spec:
           image: placeholder
           imagePullPolicy: Always
           ports:
-            - containerPort: 8000
+            - name: http
+              containerPort: 8000
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -72,4 +73,4 @@ spec:
     app: user-service
   ports:
     - port: 8000
-      targetPort: 8000
+      targetPort: 8000

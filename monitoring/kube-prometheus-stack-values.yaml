@@ -1,0 +1,58 @@
+# Helm values for prometheus-community/kube-prometheus-stack
+# Installed by .github/workflows/02-deploy-staging.yml into the "monitoring" namespace.
+#
+# Prometheus scrapes:
+#   - Kubernetes/node metrics (kube-state-metrics, node-exporter, kubelet/cAdvisor)
+#   - KoalaTech FastAPI services via monitoring/podmonitor.yaml (/metrics)
+# Grafana loads the KoalaTech dashboard from monitoring/grafana-dashboard.yaml.
+
+fullnameOverride: kps
+
+# Alertmanager is not needed for this task and would use extra cluster capacity.
+alertmanager:
+  enabled: false
+
+# AKS manages the control plane, so these components cannot be scraped.
+# Disabling them avoids permanently "down" targets.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 30s
+    retention: 2d
+    # Select every PodMonitor/ServiceMonitor in the cluster, not only
+    # those labelled with this Helm release.
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 1536Mi
+
+grafana:
+  fullnameOverride: kps-grafana
+  # adminPassword is supplied by the pipeline from the GRAFANA_ADMIN_PASSWORD secret.
+  service:
+    type: ClusterIP
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: monitoring
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi

@@ -32,11 +32,43 @@ jobs:
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
 
+      # The storage account is (re)created by Terraform, so read its
+      # connection string at deploy time instead of storing it as a secret.
+      - name: Get storage connection string from Azure
+        run: |
+          STORAGE_ACCOUNT=$(az storage account list \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --query "[?tags.ManagedBy=='Terraform'] | [0].name" -o tsv)
+          CONNECTION_STRING=$(az storage account show-connection-string \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name "$STORAGE_ACCOUNT" \
+            --query connectionString -o tsv)
+          echo "::add-mask::$CONNECTION_STRING"
+          echo "AZURE_STORAGE_CONNECTION_STRING=$CONNECTION_STRING" >> "$GITHUB_ENV"
+
       - name: Create production namespace
         run: |
           kubectl create namespace production \
             --dry-run=client \
             -o yaml | kubectl apply -f -
+
+      # Lets AKS pull images from ACR using the registry credentials
+      # (used because the lab cannot create an AcrPull role assignment).
+      - name: Create ACR image pull secret
+        run: |
+          ACR_USERNAME=$(az acr credential show --name ${{ vars.ACR_NAME }} --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name ${{ vars.ACR_NAME }} --query "passwords[0].value" -o tsv)
+          echo "::add-mask::$ACR_PASSWORD"
+          kubectl create secret docker-registry acr-pull-secret \
+            --namespace production \
+            --docker-server=${{ vars.ACR_LOGIN_SERVER }} \
+            --docker-username="$ACR_USERNAME" \
+            --docker-password="$ACR_PASSWORD" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default \
+            --namespace production \
+            -p '{"imagePullSecrets":[{"name":"acr-pull-secret"}]}'
 
       - name: Create PostgreSQL secret
         run: |
@@ -57,7 +89,7 @@ jobs:
             --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
             --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
             --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
-            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
@@ -143,3 +175,8 @@ jobs:
           kubectl get pods -n production
           kubectl get services -n production
           kubectl get pvc -n production
+
+      - name: Verify monitoring stack is running
+        run: |
+          kubectl get pods -n monitoring
+          kubectl get podmonitor -n monitoring
