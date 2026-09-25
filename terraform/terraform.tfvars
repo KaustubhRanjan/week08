@@ -16,10 +16,11 @@ storage_account_name = "sit722app2306357w10"
 aks_cluster_name = "aks-sit722-week08"
 aks_dns_prefix   = "koalatechw08"
 
-# 2 nodes keeps within the Azure for Students vCPU quota (2 x 2 vCPU)
-# and still runs staging, production and monitoring.
+# 2 x Standard_B2s_v2 (2 vCPU, 8 GB each) fits the Azure for Students quota:
+# Bsv2 family limit 10 vCPUs, total regional limit 6 vCPUs.
+# This is enough to run staging, production and monitoring.
 aks_node_count   = 2
-aks_node_vm_size = "Standard_D2s_v5"
+aks_node_vm_size = "Standard_B2s_v2"
 
 environment = "staging-production"
 
