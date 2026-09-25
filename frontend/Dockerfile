@@ -24,6 +24,10 @@ RUN npm run build
 
 FROM nginx:stable-alpine
 
+# Apply the latest Alpine security patches to the base image
+# (fixes CVE-2026-93990 in expat reported by Docker Scout).
+RUN apk upgrade --no-cache
+
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 COPY --from=build /app/dist /usr/share/nginx/html
