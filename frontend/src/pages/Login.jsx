@@ -96,6 +96,14 @@ const Login = () => {
             KoalaTech University
           </Typography>
 
+          {/* Task 9.3C: visible change to demonstrate Continuous Deployment */}
+          <Typography
+            variant="h6"
+            sx={{ color: "#2E7D32", fontWeight: 600, mb: 1 }}
+          >
+            Version 2.0 – Deployed automatically by the CD pipeline
+          </Typography>
+
           <Typography
             color="text.secondary"
             sx={{ mb: 3 }}
