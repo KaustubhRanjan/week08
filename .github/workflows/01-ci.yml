@@ -2,7 +2,14 @@ name: 01 - CI
 
 on:
   # Trigger the workflow on push to main branch
+  # (merging a pull request into main is a push to main)
   push:
+    branches:
+      - main
+
+  # Run the tests on every pull request into main, so changes are
+  # validated before they are merged and deployed (Task 9.3C)
+  pull_request:
     branches:
       - main
 
@@ -15,107 +22,7 @@ permissions:
 jobs:
 
   # =========================================================
-  # Stage 1: Infrastructure as Code (Terraform)
-  # Provisions / reconciles the resource group, ACR, AKS and
-  # storage account BEFORE any image is built or deployed.
-  # =========================================================
-  terraform:
-    name: Terraform (fmt, validate, plan, apply)
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: terraform
-
-    steps:
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Export Azure service principal for Terraform
-        env:
-          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
-        run: |
-          CLIENT_SECRET=$(jq -r '.clientSecret' <<< "$AZURE_CREDENTIALS")
-          echo "::add-mask::$CLIENT_SECRET"
-          {
-            echo "ARM_CLIENT_ID=$(jq -r '.clientId' <<< "$AZURE_CREDENTIALS")"
-            echo "ARM_CLIENT_SECRET=$CLIENT_SECRET"
-            echo "ARM_SUBSCRIPTION_ID=$(jq -r '.subscriptionId' <<< "$AZURE_CREDENTIALS")"
-            echo "ARM_TENANT_ID=$(jq -r '.tenantId' <<< "$AZURE_CREDENTIALS")"
-          } >> "$GITHUB_ENV"
-
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      # Create the Terraform state storage account on first run
-      # (idempotent - does nothing if it already exists).
-      - name: Bootstrap Terraform state storage
-        run: |
-          RG="${{ vars.TFSTATE_RESOURCE_GROUP }}"
-          SA="${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
-          if ! az storage account show --name "$SA" --resource-group "$RG" >/dev/null 2>&1; then
-            az storage account create \
-              --name "$SA" \
-              --resource-group "$RG" \
-              --location "$(az group show --name "$RG" --query location -o tsv)" \
-              --sku Standard_LRS \
-              --min-tls-version TLS1_2 \
-              --allow-blob-public-access false
-          fi
-          KEY=$(az storage account keys list --account-name "$SA" --resource-group "$RG" --query "[0].value" -o tsv)
-          echo "::add-mask::$KEY"
-          az storage container create --name tfstate --account-name "$SA" --account-key "$KEY" --output none
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.8
-          terraform_wrapper: false
-
-      - name: Terraform format check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform init (remote state in Azure Storage)
-        run: |
-          terraform init -input=false \
-            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
-            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
-            -backend-config="container_name=tfstate" \
-            -backend-config="key=week08.terraform.tfstate"
-
-      - name: Terraform validate
-        run: terraform validate -no-color
-
-      - name: Terraform plan
-        run: |
-          terraform plan -input=false -no-color -out=tfplan | tee plan.txt
-          {
-            echo "## Terraform plan"
-            echo '```'
-            grep -E "^(Plan:|No changes)" plan.txt || tail -n 5 plan.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Terraform apply
-        if: github.ref == 'refs/heads/main'
-        run: terraform apply -input=false -auto-approve tfplan
-
-      - name: Terraform outputs
-        if: github.ref == 'refs/heads/main'
-        run: |
-          {
-            echo "## Terraform outputs"
-            echo '```'
-            terraform output -no-color
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-
-  # =========================================================
-  # Stage 2: Backend Tests
+  # Stage 1: Backend Tests
   # =========================================================
   backend-test:
     name: Test ${{ matrix.service }}
@@ -205,7 +112,7 @@ jobs:
 
 
   # =========================================================
-  # Stage 3: Build, Security Scan (Docker Scout) and Push
+  # Stage 2: Build, Security Scan (Docker Scout) and Push
   # Images are scanned BEFORE they are pushed to ACR, so an
   # image with fixable critical/high CVEs never reaches the
   # registry or the cluster.
@@ -214,9 +121,10 @@ jobs:
     name: Build, scan and push ${{ matrix.image }}
     runs-on: ubuntu-latest
 
-    # Infrastructure must exist and all backend tests must pass
+    # All backend tests must pass. The Azure infrastructure (AKS, ACR,
+    # storage) is already provisioned, so the Terraform stage was removed
+    # for Task 9.3C, which focuses on the deployment stages.
     needs:
-      - terraform
       - backend-test
 
     # Build and push when code is pushed to main or manually triggered
